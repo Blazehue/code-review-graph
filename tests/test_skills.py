@@ -313,7 +313,7 @@ class TestGenerateHooksConfig:
                     )
 
     def test_install_hooks_replaces_old_and_duplicate_hooks(self, tmp_path):
-        """Regression test for #558: install_hooks replaces old absolute-path and duplicate hooks."""
+        """Regression for #558: reinstall replaces absolute-path and duplicate hooks."""
         repo = tmp_path / "repo"
         claude_dir = repo / ".claude"
         claude_dir.mkdir(parents=True)
@@ -353,12 +353,160 @@ class TestGenerateHooksConfig:
         data = json.loads(settings_file.read_text(encoding="utf-8"))
         post_hooks = data["hooks"]["PostToolUse"]
 
-        # Assert user_hook is preserved, all old CRG duplicates are purged, and 1 updated CRG hook exists
+        # user_hook preserved; old CRG duplicates purged; one updated CRG hook remains
         assert len(post_hooks) == 2
         assert post_hooks[0] == user_hook
         crg_cmd = post_hooks[1]["hooks"][0]["command"]
         assert "/old/absolute/path" not in crg_cmd
         assert "git rev-parse --show-toplevel" in crg_cmd
+
+    def test_install_hooks_preserves_user_hook_mentioning_crg(self, tmp_path):
+        """A user hook that only *mentions* code-review-graph is not a CRG hook.
+
+        The purge must key off the command shapes the generator installs
+        (``code-review-graph update`` / ``status`` / ``detect-changes``), not
+        the bare ``code-review-graph`` substring. A user command that merely
+        references the tool in an echo/comment must survive reinstall.
+        """
+        repo = tmp_path / "repo"
+        claude_dir = repo / ".claude"
+        claude_dir.mkdir(parents=True)
+        settings_file = claude_dir / "settings.json"
+
+        user_mentioning_crg = {
+            "matcher": "Edit|Write",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "echo 'about to run before code-review-graph'",
+                    "timeout": 5,
+                }
+            ],
+        }
+        settings_file.write_text(
+            json.dumps({"hooks": {"PostToolUse": [user_mentioning_crg]}}),
+            encoding="utf-8",
+        )
+
+        install_hooks(repo, platform="claude")
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        post_hooks = data["hooks"]["PostToolUse"]
+        assert user_mentioning_crg in post_hooks, (
+            "user hook that merely mentions code-review-graph was purged"
+        )
+        # The generated CRG hook is appended alongside it.
+        assert len(post_hooks) == 2
+
+    def test_install_hooks_preserves_sibling_command_in_mixed_entry(self, tmp_path):
+        """Only CRG-owned inner hooks are stripped from a mixed entry.
+
+        When a user parks their own command and a code-review-graph command
+        as siblings inside one PostToolUse entry, the reinstall must remove
+        only the CRG sibling and leave the user's command intact — not delete
+        the whole entry.
+        """
+        repo = tmp_path / "repo"
+        claude_dir = repo / ".claude"
+        claude_dir.mkdir(parents=True)
+        settings_file = claude_dir / "settings.json"
+
+        user_inner = {
+            "type": "command",
+            "command": "custom-audit --important",
+            "timeout": 15,
+        }
+        crg_inner = {
+            "type": "command",
+            "command": "code-review-graph update --repo /old/path",
+            "timeout": 30,
+        }
+        mixed_entry = {"matcher": "Edit|Write", "hooks": [user_inner, crg_inner]}
+        settings_file.write_text(
+            json.dumps({"hooks": {"PostToolUse": [mixed_entry]}}),
+            encoding="utf-8",
+        )
+
+        install_hooks(repo, platform="claude")
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        post_hooks = data["hooks"]["PostToolUse"]
+        all_inner = [h for entry in post_hooks for h in entry["hooks"]]
+        commands = [h["command"] for h in all_inner]
+        assert user_inner in all_inner, "user sibling command was deleted"
+        assert not any("/old/path" in c for c in commands), (
+            "stale CRG sibling command survived the reinstall"
+        )
+        # A fresh dynamic CRG hook is present.
+        assert any("git rev-parse --show-toplevel" in c for c in commands)
+
+    def test_install_hooks_removes_stale_legacy_precommit_entry(self, tmp_path):
+        """Stale CRG hooks parked under an event the generator no longer emits
+        (the legacy ``PreCommit``) are removed on reinstall (#558)."""
+        repo = tmp_path / "repo"
+        claude_dir = repo / ".claude"
+        claude_dir.mkdir(parents=True)
+        settings_file = claude_dir / "settings.json"
+
+        legacy_precommit = {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "code-review-graph update --repo /old/absolute/path",
+                    "timeout": 30,
+                }
+            ],
+        }
+        settings_file.write_text(
+            json.dumps({"hooks": {"PreCommit": [legacy_precommit]}}),
+            encoding="utf-8",
+        )
+
+        install_hooks(repo, platform="claude")
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert "PreCommit" not in data["hooks"], (
+            "stale legacy PreCommit CRG entry was left in place"
+        )
+        # The current events are (re)installed.
+        assert "PostToolUse" in data["hooks"]
+        assert "SessionStart" in data["hooks"]
+
+    def test_install_hooks_replaces_stale_session_start_entry(self, tmp_path):
+        """A stale SessionStart CRG entry is replaced by the current one."""
+        repo = tmp_path / "repo"
+        claude_dir = repo / ".claude"
+        claude_dir.mkdir(parents=True)
+        settings_file = claude_dir / "settings.json"
+
+        stale_session_start = {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "code-review-graph status --repo /old/absolute/path",
+                    "timeout": 10,
+                }
+            ],
+        }
+        settings_file.write_text(
+            json.dumps({"hooks": {"SessionStart": [stale_session_start]}}),
+            encoding="utf-8",
+        )
+
+        install_hooks(repo, platform="claude")
+
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        session_hooks = data["hooks"]["SessionStart"]
+        commands = [h["command"] for entry in session_hooks for h in entry["hooks"]]
+        assert not any("/old/absolute/path" in c for c in commands), (
+            "stale SessionStart CRG entry was not replaced"
+        )
+        assert any("git rev-parse --show-toplevel" in c for c in commands), (
+            "current dynamic SessionStart hook missing after reinstall"
+        )
+        assert len(session_hooks) == 1
 
     def test_post_tool_use_matcher_excludes_bash(self):
         """Regression test for #549: Bash matcher fires on every shell command."""
